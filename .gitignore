@@ -1,0 +1,34 @@
+# --- Rust & Cargo ---
+/target
+/debug
+/release
+**/*.rs.bk
+Cargo.lock
+
+# --- eBPF Artifacts ---
+/**/target/
+/ebpf/target
+
+# --- Project Redshift Logs & Reports ---
+*.log
+*.json
+*.html
+*.csv
+.redshift
+.aion
+
+# --- OS Generated Files ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# --- IDE & Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

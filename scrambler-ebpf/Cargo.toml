@@ -1,0 +1,18 @@
+[package]
+name = "scrambler-ebpf"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+[dependencies]
+aya-ebpf = { git = "https://github.com/aya-rs/aya", branch = "main" }
+
+[lib]
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
