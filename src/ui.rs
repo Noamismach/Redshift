@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::analysis::{Interpretation, Observation, SkewReport};
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -36,25 +36,44 @@ pub struct UiState {
 }
 
 pub fn run(state: UiState) -> UiResult<()> {
+    run_with_handler(state, TICK_RATE, || Ok(()))
+}
+
+pub fn run_with_handler<F>(state: UiState, tick_rate: Duration, mut on_tick: F) -> UiResult<()>
+where
+    F: FnMut() -> UiResult<()>,
+{
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_loop(&mut terminal, &state);
+    let result = run_loop_with_handler(&mut terminal, &state, tick_rate, &mut on_tick);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
 }
 
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, state: &UiState) -> UiResult<()> {
+fn run_loop_with_handler<F>(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    state: &UiState,
+    tick_rate: Duration,
+    on_tick: &mut F,
+) -> UiResult<()>
+where
+    F: FnMut() -> UiResult<()>,
+{
     while state.running.load(Ordering::Relaxed) {
         terminal.draw(|frame| draw(frame, state))?;
+        on_tick()?;
 
-        if event::poll(TICK_RATE)? {
+        if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
+                if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
+                {
                     state.running.store(false, Ordering::Relaxed);
                 }
             }

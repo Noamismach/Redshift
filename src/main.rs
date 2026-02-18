@@ -56,9 +56,10 @@ use std::fs::File;
 use std::io::{self, BufWriter};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use analysis::{calculate_skew, interpret_report, Interpretation, Observation, SkewReport};
 use config::Config;
@@ -69,6 +70,14 @@ use ui::UiState;
 const ANALYSIS_INTERVAL: u64 = 50;
 const NS_PER_SEC: f64 = 1_000_000_000.0;
 const SOURCE_PORT: u16 = 54_321;
+const UI_TICK_RATE: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone)]
+struct Measurement {
+    kernel_time_ns: u64,
+    sender_ts_val: u32,
+    src_ip: IpAddr,
+}
 
 fn main() {
     env_logger::init();
@@ -131,18 +140,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let file = File::create("measurements.csv")?;
-    let csv_writer = csv::Writer::from_writer(BufWriter::new(file));
+    let mut csv_writer = csv::Writer::from_writer(BufWriter::new(file));
+    csv_writer.write_record(["kernel_time_ns", "sender_ts_val", "src_ip"])?;
+    csv_writer.flush()?;
 
+    let (tx, rx) = mpsc::channel();
     let capture_handle = spawn_capture_thread(
         socket,
-        csv_writer,
         target_filter,
-        Arc::clone(&observations),
-        Arc::clone(&latest_report),
-        Arc::clone(&latest_interpretation),
-        Arc::clone(&status_text),
-        Arc::clone(&adaptive_interval),
         Arc::clone(&running),
+        tx,
     );
 
     let ui_state = UiState {
@@ -156,11 +163,32 @@ fn run() -> Result<(), Box<dyn Error>> {
         running: Arc::clone(&running),
     };
 
-    let ui_result = ui::run(ui_state);
+    let mut packet_counter: u64 = 0;
+    let ui_result = ui::run_with_handler(ui_state, UI_TICK_RATE, || {
+        drain_measurements(
+            &rx,
+            target_filter,
+            &observations,
+            &latest_report,
+            &latest_interpretation,
+            &status_text,
+            &adaptive_interval,
+            &mut csv_writer,
+            &mut packet_counter,
+            &running,
+        )
+    });
     
     running.store(false, Ordering::Relaxed);
+    if let Ok(mut status) = status_text.lock() {
+        *status = String::from("Stopped (awaiting shutdown)");
+    }
     if let Err(err) = capture_handle.join() {
         log::error!("Capture thread panicked: {:?}", err);
+    }
+
+    if let Err(err) = csv_writer.flush() {
+        log::warn!("Failed to flush CSV writer: {err}");
     }
 
     let samples = {
@@ -239,52 +267,25 @@ fn print_exit_report(report: SkewReport, samples: usize) {
     println!("--------------------------------\n");
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_capture_thread(
     socket: Socket,
-    csv_writer: csv::Writer<BufWriter<File>>,
     target_filter: Option<IpAddr>,
-    observations: Arc<Mutex<Vec<Observation>>>,
-    latest_report: Arc<Mutex<Option<SkewReport>>>,
-    latest_interpretation: Arc<Mutex<Option<Interpretation>>>,
-    status_text: Arc<Mutex<String>>,
-    adaptive_interval: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
+    sender: mpsc::Sender<Measurement>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        if let Err(err) = capture_loop(
-            socket,
-            csv_writer,
-            target_filter,
-            observations,
-            latest_report,
-            latest_interpretation,
-            status_text,
-            adaptive_interval,
-            running,
-        ) {
+        if let Err(err) = sniff_loop(socket, target_filter, running, sender) {
             log::error!("Capture loop terminated: {err}");
         }
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn capture_loop(
+fn sniff_loop(
     socket: Socket,
-    mut csv_writer: csv::Writer<BufWriter<File>>,
     target_filter: Option<IpAddr>,
-    observations: Arc<Mutex<Vec<Observation>>>,
-    latest_report: Arc<Mutex<Option<SkewReport>>>,
-    latest_interpretation: Arc<Mutex<Option<Interpretation>>>,
-    status_text: Arc<Mutex<String>>,
-    adaptive_interval: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
+    sender: mpsc::Sender<Measurement>,
 ) -> Result<(), Box<dyn Error>> {
-    csv_writer.write_record(["kernel_time_ns", "sender_ts_val", "src_ip"])?;
-    csv_writer.flush()?;
-
-    let mut packet_counter: u64 = 0;
-
     while running.load(Ordering::Relaxed) {
         let sample = match sniffer::recv_packet(&socket) {
             Ok(Some(sample)) => sample,
@@ -304,41 +305,78 @@ fn capture_loop(
             }
         }
 
+        let measurement = Measurement {
+            kernel_time_ns: sample.kernel_time_ns,
+            sender_ts_val: sample.sender_ts_val,
+            src_ip: sample.src_ip,
+        };
+
+        if sender.send(measurement).is_err() {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_measurements(
+    receiver: &Receiver<Measurement>,
+    target_filter: Option<IpAddr>,
+    observations: &Arc<Mutex<Vec<Observation>>>,
+    latest_report: &Arc<Mutex<Option<SkewReport>>>,
+    latest_interpretation: &Arc<Mutex<Option<Interpretation>>>,
+    status_text: &Arc<Mutex<String>>,
+    adaptive_interval: &Arc<AtomicU64>,
+    csv_writer: &mut csv::Writer<BufWriter<File>>,
+    packet_counter: &mut u64,
+    running: &Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        let measurement = match receiver.try_recv() {
+            Ok(sample) => sample,
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                running.store(false, Ordering::Relaxed);
+                break;
+            }
+        };
+
+        *packet_counter += 1;
         let observation = Observation::new(
-            sample.kernel_time_ns as f64 / NS_PER_SEC,
-            sample.sender_ts_val as f64,
+            measurement.kernel_time_ns as f64 / NS_PER_SEC,
+            measurement.sender_ts_val as f64,
         );
 
-        packet_counter += 1;
-        // TODO: Stop cloning the whole buffer; ring buffer would be enough for hull fits.
         let mut obs_snapshot: Option<Vec<Observation>> = None;
         {
             let mut guard = observations.lock().expect("observation buffer poisoned");
             guard.push(observation);
-            if packet_counter % ANALYSIS_INTERVAL == 0 {
+            if *packet_counter % ANALYSIS_INTERVAL == 0 {
                 obs_snapshot = Some(guard.clone());
             }
         }
 
         csv_writer.write_record([
-            sample.kernel_time_ns.to_string(),
-            sample.sender_ts_val.to_string(),
-            sample.src_ip.to_string(),
+            measurement.kernel_time_ns.to_string(),
+            measurement.sender_ts_val.to_string(),
+            measurement.src_ip.to_string(),
         ])?;
         csv_writer.flush()?;
 
         if let Ok(mut status) = status_text.lock() {
             *status = format!(
                 "Capturing | samples={} | last src={}",
-                packet_counter, sample.src_ip
+                *packet_counter, measurement.src_ip
             );
         }
 
         if let Some(obs_snapshot) = obs_snapshot {
             if let Some(report) = calculate_skew(&obs_snapshot) {
-                let display_ip = target_filter.unwrap_or(sample.src_ip);
+                let display_ip = target_filter.unwrap_or(measurement.src_ip);
+                let packet_index = *packet_counter;
                 log::info!(
-                    "[Packet #{packet_counter}] Target: {display_ip} | Points: {} | Slope: {:.9} | Skew: {:.2} ppm | R²: {:.3} | Verdict: {}",
+                    "[Packet #{packet_index}] Target: {display_ip} | Points: {} | Slope: {:.9} | Skew: {:.2} ppm | R²: {:.3} | Verdict: {}",
                     obs_snapshot.len(),
                     report.slope,
                     report.ppm,
@@ -366,10 +404,6 @@ fn capture_loop(
                 log::warn!("Insufficient hull points to compute skew at packet #{packet_counter}");
             }
         }
-    }
-
-    if let Ok(mut status) = status_text.lock() {
-        *status = String::from("Stopped (awaiting shutdown)");
     }
 
     Ok(())
